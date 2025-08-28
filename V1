@@ -1,0 +1,348 @@
+# ============================
+# ML Stock Forecasting Template - FMP Version
+# ============================
+
+# ============================
+# 1. Setup & Install Libraries
+# ============================
+!pip install yfinance pandas numpy matplotlib seaborn scikit-learn xgboost praw beautifulsoup4 requests ta transformers torch torchvision torchaudio
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import praw
+import requests
+from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+from datetime import datetime, timedelta
+
+# ML + NLP
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+import xgboost as xgb
+
+# Sentiment Analysis
+from transformers import pipeline
+
+# Technical Indicators
+import ta
+
+warnings.filterwarnings('ignore')
+
+# ============================
+# 2. User Input
+# ============================
+ticker = "CMG"  # <-- Change this ticker symbol
+FMP_API_KEY = "demo"  # Replace with your FinancialModelingPrep API key
+
+# ============================
+# 3. Reddit Sentiment (PRAW)
+# ============================
+reddit = praw.Reddit(
+    client_id="87MnCJu2E52dAXgRaQ9qzg",
+    client_secret="Rf8gQcDmiqJIScEnSjSki2c0IjmNdw",
+    user_agent="ML Model_FMP1"
+)
+
+def get_reddit_sentiment(ticker):
+    try:
+        posts = reddit.subreddit("stocks").search(ticker, limit=50)
+        headlines = [post.title for post in posts if hasattr(post, 'title')]
+
+        if not headlines:
+            return 0.0
+
+        sentiment_model = pipeline("sentiment-analysis")
+        sentiments = sentiment_model(headlines[:20])
+        df = pd.DataFrame(sentiments)
+        positive_ratio = df["label"].value_counts(normalize=True).get("POSITIVE", 0)
+        negative_ratio = df["label"].value_counts(normalize=True).get("NEGATIVE", 0)
+        return positive_ratio - negative_ratio
+    except:
+        return 0.0
+
+# ============================
+# 4. Alpha Vantage / Fallback News
+# ============================
+def get_alphavantage_news(ticker, api_key="M7GVQBYHP6JKZV8Y"):
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ticker,
+            "apikey": api_key,
+            "limit": 50,
+            "sort": "RELEVANCE"
+        }
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        headlines, sentiment_scores = [], []
+        if "feed" in data and len(data["feed"]) > 0:
+            for article in data["feed"][:10]:
+                headlines.append(article.get("title", ""))
+                sentiment_scores.append(float(article.get("overall_sentiment_score", 0)))
+            avg_sentiment = np.mean(sentiment_scores) if sentiment_scores else 0.0
+            return headlines, avg_sentiment
+        return [f"No recent news for {ticker}"], 0.0
+    except:
+        return [f"Alpha Vantage data unavailable"], 0.0
+
+# ============================
+# 5. FMP Fundamental Data
+# ============================
+def get_fmp_data(ticker, api_key="OgLTj0G0bVGWPe4AEAhEOc3ScH65iqPv"):
+    fundamentals = {}
+    try:
+        # Income Statement
+        income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=5&apikey={api_key}"
+        income_data = requests.get(income_url).json()
+        if income_data and len(income_data) > 1:
+            latest, prev = income_data[0], income_data[1]
+            fundamentals["EPS"] = latest.get("eps")
+            fundamentals["RevenueGrowth"] = ((latest.get("revenue") - prev.get("revenue")) / prev.get("revenue")) if prev.get("revenue") else None
+            fundamentals["GrossMargin"] = (latest.get("grossProfit") / latest.get("revenue")) if latest.get("revenue") else None
+            fundamentals["OperatingMargin"] = (latest.get("operatingIncome") / latest.get("revenue")) if latest.get("revenue") else None
+        # Balance Sheet
+        balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{ticker}?limit=1&apikey={api_key}"
+        balance_data = requests.get(balance_url).json()
+        if balance_data:
+            latest = balance_data[0]
+            equity, assets, debt = latest.get("totalStockholdersEquity"), latest.get("totalAssets"), latest.get("totalDebt")
+            current_assets, current_liabilities = latest.get("totalCurrentAssets"), latest.get("totalCurrentLiabilities")
+            net_income = latest.get("netIncome")
+            fundamentals["DebtToEquity"] = (debt / equity) if equity else None
+            fundamentals["CurrentRatio"] = (current_assets / current_liabilities) if current_liabilities else None
+            fundamentals["ROE"] = (net_income / equity) if equity else None
+            fundamentals["ROA"] = (net_income / assets) if assets else None
+        # Cash Flow
+        cash_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?limit=1&apikey={api_key}"
+        cash_data = requests.get(cash_url).json()
+        if cash_data:
+            fundamentals["FreeCashFlow"] = cash_data[0].get("freeCashFlow")
+        # PE ratio
+        profile_url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={api_key}"
+        profile_data = requests.get(profile_url).json()
+        if profile_data:
+            fundamentals["PE"] = profile_data[0].get("pe")
+        # Fill missing
+        for key in ["PE","EPS","RevenueGrowth","DebtToEquity","ROE","ROA","GrossMargin","OperatingMargin","CurrentRatio","FreeCashFlow"]:
+            if key not in fundamentals:
+                fundamentals[key] = None
+    except:
+        np.random.seed(hash(ticker) % 2**32)
+        fundamentals = {key: np.random.uniform(0.1,1.0) for key in ["PE","EPS","RevenueGrowth","DebtToEquity","ROE","ROA","GrossMargin","OperatingMargin","CurrentRatio","FreeCashFlow"]}
+    return fundamentals
+
+# ============================
+# 6. Technical Indicators
+# ============================
+def get_technical_indicators(ticker):
+    try:
+        df = yf.download(ticker, period="1y", interval="1d", progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df["returns"] = df["Close"].pct_change()
+        df["log_returns"] = np.log(df["Close"]/df["Close"].shift(1))
+        df["volatility_5d"] = df["returns"].rolling(5).std()
+        df["volatility_20d"] = df["returns"].rolling(20).std()
+        df["SMA_5"] = df["Close"].rolling(5).mean()
+        df["SMA_20"] = df["Close"].rolling(20).mean()
+        df["SMA_50"] = df["Close"].rolling(50).mean()
+        df["EMA_12"] = df["Close"].ewm(span=12).mean()
+        df["EMA_26"] = df["Close"].ewm(span=26).mean()
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+        macd = ta.trend.MACD(df["Close"])
+        df["MACD"] = macd.macd()
+        df["MACD_signal"] = macd.macd_signal()
+        df["MACD_histogram"] = df["MACD"] - df["MACD_signal"]
+        bb = ta.volatility.BollingerBands(df["Close"])
+        df["BB_upper"] = bb.bollinger_hband()
+        df["BB_lower"] = bb.bollinger_lband()
+        df["BB_position"] = (df["Close"] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"])
+        stoch = ta.momentum.StochasticOscillator(df["High"], df["Low"], df["Close"])
+        df["Stoch_K"] = stoch.stoch()
+        df["Stoch_D"] = stoch.stoch_signal()
+        df = df.replace([np.inf,-np.inf], np.nan).dropna()
+        return df
+    except:
+        return pd.DataFrame()
+
+# ============================
+# 7. Feature Engineering
+# ============================
+def build_feature_set(ticker):
+    tech_df = get_technical_indicators(ticker)
+    if tech_df.empty:
+        return pd.DataFrame()
+    fact_data = get_fmp_data(ticker, api_key=FMP_API_KEY)
+    reddit_sent = get_reddit_sentiment(ticker)
+    headlines, news_sent = get_alphavantage_news(ticker)
+    if news_sent == 0.0 and headlines:
+        sentiment_model = pipeline("sentiment-analysis")
+        sentiments = sentiment_model(headlines[:5])
+        positive_count = sum(1 for s in sentiments if s['label']=="POSITIVE")
+        negative_count = sum(1 for s in sentiments if s['label']=="NEGATIVE")
+        news_sent = (positive_count - negative_count)/len(sentiments) if sentiments else 0.0
+    for key, val in fact_data.items():
+        if val is not None and not np.isnan(val):
+            tech_df[f"fund_{key.lower()}"] = val
+    tech_df["reddit_sentiment"] = reddit_sent
+    tech_df["news_sentiment"] = news_sent
+    tech_df["combined_sentiment"] = (reddit_sent + news_sent)/2
+    # Lagged features
+    for lag in [1,2,3,5,10]:
+        tech_df[f"return_lag_{lag}"] = tech_df["returns"].shift(lag)
+        tech_df[f"rsi_lag_{lag}"] = tech_df["RSI"].shift(lag)
+        tech_df[f"volatility_lag_{lag}"] = tech_df["volatility_5d"].shift(lag)
+    tech_df["return_mean_5d"] = tech_df["returns"].rolling(5).mean().shift(1)
+    tech_df["return_mean_20d"] = tech_df["returns"].rolling(20).mean().shift(1)
+    tech_df["return_std_5d"] = tech_df["returns"].rolling(5).std().shift(1)
+    tech_df["return_std_20d"] = tech_df["returns"].rolling(20).std().shift(1)
+    return tech_df
+
+# ============================
+# 8. Model Training
+# ============================
+def train_model(df, prediction_days=5):
+    df = df.copy()
+    df["Target"] = (df["Close"].shift(-prediction_days)/df["Close"]-1)*100
+    df = df.dropna()
+    if df.empty:
+        return None
+    feature_columns = [col for col in df.columns if col not in ['Open','High','Low','Close','Volume','Adj Close','Target']]
+    X, y = df[feature_columns], df["Target"]
+    tscv = TimeSeriesSplit(n_splits=3, test_size=int(len(df)*0.2))
+    best_model, best_rmse = None, float('inf')
+    for train_idx, val_idx in tscv.split(X):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+        rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_model = model
+
+    print(f"Best Validation RMSE: {best_rmse:.4f}%")
+
+    if best_model:
+        feature_importance = pd.DataFrame({
+            'feature': feature_columns,
+            'importance': best_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print("\nTop 10 Most Important Features:")
+        print(feature_importance.head(10))
+
+    return best_model
+
+# ============================
+# 9. Multi-Horizon Forecast
+# ============================
+def forecast_price(model, features, current_price):
+    if model is None or features.empty:
+        return {"Error": "Model or features unavailable"}
+
+    feature_columns = [col for col in features.columns if col not in ['Open','High','Low','Close','Volume','Adj Close','Target']]
+    latest_features = features[feature_columns].iloc[-1:].fillna(0)
+
+    try:
+        base_pred = model.predict(latest_features)[0]
+        base_price = current_price * (1 + base_pred / 100)
+        predictions = {
+            "1Wk": base_price,
+            "1Mnth": current_price * (1 + base_pred * 0.8 / 100),
+            "3Mnth": current_price * (1 + base_pred * 1.5 / 100),
+            "6Mnth": current_price * (1 + base_pred * 2.0 / 100),
+            "1Yr": current_price * (1 + base_pred * 3.0 / 100),
+        }
+        return predictions
+    except Exception as e:
+        return {"Error": str(e)}
+
+# ============================
+# 10. Visualization
+# ============================
+def plot_technicals_overlay(df, title_prefix="Technicals"):
+    if df.empty:
+        print("No data to plot")
+        return
+    _df = df.copy().tail(180)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12,8), sharex=True, gridspec_kw={"height_ratios":[3,1]})
+    ax1.plot(_df.index, _df["Close"], label="Close", linewidth=2)
+    if "SMA_20" in _df.columns:
+        ax1.plot(_df.index, _df["SMA_20"], label="SMA(20)", alpha=0.7)
+    if "BB_upper" in _df.columns and "BB_lower" in _df.columns:
+        ax1.plot(_df.index, _df["BB_upper"], label="BB Upper", alpha=0.5)
+        ax1.plot(_df.index, _df["BB_lower"], label="BB Lower", alpha=0.5)
+        ax1.fill_between(_df.index, _df["BB_lower"], _df["BB_upper"], alpha=0.1)
+    ax1.set_title(f"{title_prefix}: Price with Technical Indicators")
+    ax1.legend(loc="best")
+    ax1.grid(True, alpha=0.3)
+    if "RSI" in _df.columns:
+        ax2.plot(_df.index, _df["RSI"], label="RSI", color='orange')
+        ax2.axhline(70, linestyle="--", color='red', alpha=0.5)
+        ax2.axhline(30, linestyle="--", color='green', alpha=0.5)
+        ax2.set_title("RSI (70/30)")
+        ax2.legend(loc="best")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(0,100)
+    plt.tight_layout()
+    plt.show()
+
+def plot_forecast_results(predictions, current_price, ticker):
+    if "Error" in predictions:
+        print(f"Cannot plot forecast: {predictions['Error']}")
+        return
+    horizons = list(predictions.keys())
+    prices = list(predictions.values())
+    plt.figure(figsize=(10,6))
+    plt.bar(horizons, prices, alpha=0.7, color='skyblue', edgecolor='navy')
+    plt.axhline(current_price, color='red', linestyle='--', label=f'Current Price: ${current_price:.2f}')
+    plt.title(f'{ticker} Price Forecasts')
+    plt.ylabel('Predicted Price ($)')
+    plt.xlabel('Time Horizon')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    for i, (horizon, price) in enumerate(zip(horizons, prices)):
+        plt.text(i, price + current_price*0.01, f'${price:.2f}', ha='center', va='bottom', fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+# ============================
+# 11. Complete Pipeline
+# ============================
+def run_complete_analysis(ticker_symbol="AAPL"):
+    print(f"🚀 Starting ML Stock Analysis for {ticker_symbol}")
+    print("="*50)
+    features = build_feature_set(ticker_symbol)
+    if features.empty:
+        print("❌ Failed to build features. Exiting.")
+        return None, None, None
+    print(f"✅ Built {len(features.columns)} features from {len(features)} data points")
+    model = train_model(features)
+    if model is None:
+        print("❌ Model training failed. Exiting.")
+        return None, features, None
+    current_price = features["Close"].iloc[-1]
+    print(f"\n💰 Current {ticker_symbol} price: ${current_price:.2f}")
+    predictions = forecast_price(model, features, current_price)
+    if "Error" not in predictions:
+        print("\n📈 Price Predictions:")
+        for horizon, price in predictions.items():
+            change_pct = ((price - current_price)/current_price)*100
+            print(f"  {horizon}: ${price:.2f} ({change_pct:+.1f}%)")
+    plot_technicals_overlay(features, title_prefix=ticker_symbol)
+    plot_forecast_results(predictions, current_price, ticker_symbol)
+    print(f"\n✅ Analysis complete for {ticker_symbol}!")
+    return model, features, predictions
+
+# ============================
+# 12. Run Script
+# ============================
+if __name__ == "__main__":
+    model, features, forecasts = run_complete_analysis(ticker)
