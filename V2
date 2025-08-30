@@ -1,0 +1,1069 @@
+# ============================
+# ML Stock Forecasting Template - Enhanced with Quarterly Technical Trends
+# ============================
+
+# ============================
+# 1. Setup & Install Libraries
+# ============================
+!pip install yfinance pandas numpy matplotlib seaborn scikit-learn xgboost praw beautifulsoup4 requests ta transformers torch torchvision torchaudio
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import praw
+import requests
+from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+from datetime import datetime, timedelta
+import re
+
+# ML + NLP
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+import xgboost as xgb
+
+# Sentiment Analysis
+from transformers import pipeline
+
+# Technical Indicators
+import ta
+
+warnings.filterwarnings('ignore')
+
+# ============================
+# 2. User Input
+# ============================
+ticker = "TSLA"  # <-- Change this ticker symbol
+FMP_API_KEY = "OgLTj0G0bVGWPe4AEAhEOc3ScH65iqPv"  # Replace with your FinancialModelingPrep API key
+GNEWS_API_KEY = "e4e61c020914bfa2410b24842967a9af"
+
+# ============================
+# 2c. Get Sector Info
+# ============================
+
+def get_sp500_constituents():
+    """
+    Scrape S&P 500 tickers and sectors dynamically from Wikipedia.
+    Returns a DataFrame with ticker + sector.
+    """
+
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0"}  # mimic a browser
+
+    response = requests.get(url, headers=headers, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch S&P 500 table: {response.status_code}")
+
+    table = pd.read_html(response.text)[0]
+    table = table[['Symbol', 'GICS Sector']]
+    return table.rename(columns={'Symbol': 'ticker', 'GICS Sector': 'sector'})
+
+
+# Map sector → ETF
+sector_to_etf = {
+    "Information Technology": "XLK",
+    "Health Care": "XLV",
+    "Financials": "XLF",
+    "Energy": "XLE",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Industrials": "XLI",
+    "Materials": "XLB",
+    "Communication Services": "XLC",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE"
+}
+
+def get_sector_etf(ticker):
+    """
+    Given a stock ticker, return its sector ETF symbol (e.g. AAPL -> XLK).
+    If the stock is not in the S&P 500, returns None.
+    """
+    sp500 = get_sp500_constituents()
+    row = sp500[sp500['ticker'] == ticker]
+    if row.empty:
+        return None
+    sector = row['sector'].iloc[0]
+    return sector_to_etf.get(sector, None)
+
+# ============================
+# 3. Reddit Sentiment (Pushshift Historical + Recent)
+# ============================
+# Initialize Hugging Face sentiment model
+reddit_sentiment_model = pipeline("sentiment-analysis")
+
+def clean_text(text):
+    text = re.sub(r"http\S+", "", text)
+    text = re.sub(r"[^a-zA-Z\s]", "", text)
+    return text.strip()
+
+def fetch_reddit_pushshift(ticker, subreddit="stocks", after_days=0, years_back=None):
+    """
+    Fetch Reddit posts using Pushshift API.
+    - years_back: fetch posts from last X years (long-term)
+    - after_days: fetch posts from last X days (short-term)
+    Returns a DataFrame with 'headline' and 'created_utc'.
+    """
+    end_epoch = int(datetime.utcnow().timestamp())
+    if years_back:
+        start_epoch = int((datetime.utcnow() - timedelta(days=365*years_back)).timestamp())
+    elif after_days:
+        start_epoch = int((datetime.utcnow() - timedelta(days=after_days)).timestamp())
+    else:
+        start_epoch = 0
+
+    url = "https://api.pushshift.io/reddit/search/submission/"
+    headlines = []
+    size = 500  # max posts per request
+    params = {
+        "q": ticker,
+        "subreddit": subreddit,
+        "after": start_epoch,
+        "before": end_epoch,
+        "size": size,
+        "sort": "asc"
+    }
+
+    try:
+        while True:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            response = requests.get(url, params=params, timeout=30)
+            data = response.json().get("data", [])
+            if not data:
+                break
+            for post in data:
+                if post.get("title"):
+                    headlines.append({"headline": clean_text(post["title"]), "created_utc": post["created_utc"]})
+            # move forward in time
+            params["after"] = data[-1]["created_utc"]
+            if len(data) < size:
+                break
+    except:
+        pass
+
+    return pd.DataFrame(headlines)
+
+def analyze_sentiment(texts):
+    """Compute average sentiment for a list of texts."""
+    if not texts:
+        return 0.0
+    scores = []
+    for t in texts:
+        try:
+            res = reddit_sentiment_model(t[:512])[0]
+            score = res["score"] if res["label"] == "POSITIVE" else -res["score"]
+            scores.append(score)
+        except:
+            continue
+    return np.mean(scores) if scores else 0.0
+
+def get_reddit_long_term_sentiment(ticker):
+    """Average sentiment of Reddit posts for last 3 years."""
+    try:
+        df = fetch_reddit_pushshift(ticker, years_back=3)
+        if df.empty:
+            return 0.0
+        df["date"] = pd.to_datetime(df["created_utc"], unit="s")
+        df["quarter"] = df["date"].dt.to_period("Q")
+        sentiment_by_quarter = []
+        for q, group in df.groupby("quarter"):
+            sentiment_by_quarter.append(analyze_sentiment(group["headline"].tolist()))
+        return np.mean(sentiment_by_quarter)
+    except Exception as e:
+        print(f"Reddit Long-Term Error: {e}")
+        return 0.0
+
+def get_reddit_recent_sentiment(ticker):
+    """Average sentiment of Reddit posts in the last 7 days."""
+    try:
+        df = fetch_reddit_pushshift(ticker, after_days=7)
+        if df.empty:
+            return 0.0
+        return analyze_sentiment(df["headline"].tolist())
+    except Exception as e:
+        print(f"Reddit Recent Error: {e}")
+        return 0.0
+
+# ============================
+# 4. News Sentiment (GDELT Archive + GNews Recent)
+# ============================
+sentiment_model = pipeline("sentiment-analysis")
+
+def analyze_news_sentiment(texts):
+    """Helper to score sentiment list -> avg score."""
+    if not texts:
+        return 0.0
+    scores = []
+    for t in texts:
+        try:
+            result = sentiment_model(t[:512])[0]  # truncate long headlines
+            score = result["score"]
+            if result["label"] == "NEGATIVE":
+                score = -score
+            scores.append(score)
+        except:
+            continue
+    return np.mean(scores) if scores else 0.0
+
+def get_gdelt_news(ticker):
+    """
+    Fetch historical archive headlines from GDELT until 7 days ago.
+    Chunk into 3-month intervals, return dataframe with avg sentiment per chunk.
+    """
+    try:
+        end_date = datetime.utcnow() - timedelta(days=7)
+        start_date = end_date - timedelta(days=730)  # last 2 years
+
+        url = f"https://api.gdeltproject.org/api/v2/doc/doc?query={ticker}&mode=artlist&maxrecords=250&sourcelang=english&format=json"
+        response = requests.get(url, timeout=20)
+        data = response.json()
+
+        if "articles" not in data:
+            return pd.DataFrame()
+
+        # Collect (date, headline)
+        records = []
+        for a in data["articles"]:
+            date = datetime.strptime(a["seendate"][:8], "%Y%m%d")
+            if start_date <= date <= end_date:
+                records.append((date, clean_text(a["title"])))
+
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records, columns=["date","headline"])
+        df["quarter"] = df["date"].dt.to_period("Q")
+
+        # Aggregate sentiment by quarter
+        sentiment = []
+        for q, group in df.groupby("quarter"):
+            avg_sent = analyze_news_sentiment(group["headline"].tolist())
+            sentiment.append({"quarter": str(q), "sentiment": avg_sent})
+
+        return pd.DataFrame(sentiment)
+    except Exception as e:
+        print(f"GDELT error: {e}")
+        return pd.DataFrame()
+
+def get_gnews_recent(ticker, api_key):
+    """
+    Fetch last 7 days of GNews headlines for ticker.
+    """
+    try:
+        from_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00Z")
+        to_date = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
+
+        url = "https://gnews.io/api/v4/search"
+        params = {
+            "q": ticker,
+            "token": api_key,
+            "max": 10,
+            "lang": "en",
+            "sortby": "relevance",
+            "from": from_date,
+            "to": to_date,
+        }
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+
+        if "articles" not in data or len(data["articles"]) == 0:
+            return 0.0
+
+        headlines = [clean_text(a.get("title","")) for a in data["articles"][:10]]
+        return analyze_news_sentiment(headlines)
+
+    except Exception as e:
+        print(f"GNews error: {e}")
+        return 0.0
+
+# ============================
+# 5. FMP Fundamental Data
+# ============================
+def get_fmp_data(ticker, api_key="OgLTj0G0bVGWPe4AEAhEOc3ScH65iqPv"):
+    fundamentals = {}
+    try:
+        # Income Statement
+        income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=5&apikey={api_key}"
+        income_data = requests.get(income_url).json()
+        if income_data and len(income_data) > 1:
+            latest, prev = income_data[0], income_data[1]
+            fundamentals["EPS"] = latest.get("eps")
+            fundamentals["RevenueGrowth"] = ((latest.get("revenue") - prev.get("revenue")) / prev.get("revenue")) if prev.get("revenue") else None
+            fundamentals["GrossMargin"] = (latest.get("grossProfit") / latest.get("revenue")) if latest.get("revenue") else None
+            fundamentals["OperatingMargin"] = (latest.get("operatingIncome") / latest.get("revenue")) if latest.get("revenue") else None
+        # Balance Sheet
+        balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{ticker}?limit=1&apikey={api_key}"
+        balance_data = requests.get(balance_url).json()
+        if balance_data:
+            latest = balance_data[0]
+            equity, assets, debt = latest.get("totalStockholdersEquity"), latest.get("totalAssets"), latest.get("totalDebt")
+            current_assets, current_liabilities = latest.get("totalCurrentAssets"), latest.get("totalCurrentLiabilities")
+            net_income = latest.get("netIncome")
+            fundamentals["DebtToEquity"] = (debt / equity) if equity else None
+            fundamentals["CurrentRatio"] = (current_assets / current_liabilities) if current_liabilities else None
+            fundamentals["ROE"] = (net_income / equity) if equity else None
+            fundamentals["ROA"] = (net_income / assets) if assets else None
+        # Cash Flow
+        cash_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?limit=1&apikey={api_key}"
+        cash_data = requests.get(cash_url).json()
+        if cash_data:
+            fundamentals["FreeCashFlow"] = cash_data[0].get("freeCashFlow")
+        # PE ratio
+        profile_url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={api_key}"
+        profile_data = requests.get(profile_url).json()
+        if profile_data:
+            fundamentals["PE"] = profile_data[0].get("pe")
+        # Fill missing
+        for key in ["PE","EPS","RevenueGrowth","DebtToEquity","ROE","ROA","GrossMargin","OperatingMargin","CurrentRatio","FreeCashFlow"]:
+            if key not in fundamentals:
+                fundamentals[key] = None
+    except:
+        np.random.seed(hash(ticker) % 2**32)
+        fundamentals = {key: np.random.uniform(0.1,1.0) for key in ["PE","EPS","RevenueGrowth","DebtToEquity","ROE","ROA","GrossMargin","OperatingMargin","CurrentRatio","FreeCashFlow"]}
+    return fundamentals
+
+# ============================
+# 5b. Macro Data (Yahoo Finance, 3 Years)
+# ============================
+def get_macro_data():
+    start_date = (datetime.utcnow() - timedelta(days=3*365)).strftime("%Y-%m-%d")
+    end_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    macros = {}
+
+    try:
+        tnx = yf.download("^TNX", start=start_date, end=end_date, interval="1d")
+        macros["10y_yield"] = tnx["Close"] / 100.0
+        vix = yf.download("^VIX", start=start_date, end=end_date, interval="1d")
+        macros["vix"] = vix["Close"]
+        dxy = yf.download("DX-Y.NYB", start=start_date, end=end_date, interval="1d")
+        macros["dxy"] = dxy["Close"]
+        gold = yf.download("GC=F", start=start_date, end=end_date, interval="1d")
+        macros["gold"] = gold["Close"]
+
+        macro_df = pd.concat(macros, axis=1)
+        # flatten MultiIndex
+        macro_df.columns = [col[0] if isinstance(col, tuple) else col for col in macro_df.columns]
+
+        macro_df = macro_df.dropna().reset_index()
+        macro_df.rename(columns={"Date": "date"}, inplace=True)
+        return macro_df
+
+    except Exception as e:
+        print(f"Macro fetch error: {e}")
+        return pd.DataFrame()
+
+# ============================
+# 6. Technical Indicators with Quarterly Trends
+# ============================
+def calculate_trend_slope(values):
+    """Calculate linear trend slope of a time series."""
+    if len(values) < 2:
+        return 0
+    x = np.arange(len(values))
+    y = np.array(values)
+
+    # Remove any NaN values
+    mask = ~np.isnan(y)
+    if mask.sum() < 2:
+        return 0
+
+    x, y = x[mask], y[mask]
+    try:
+        slope = np.polyfit(x, y, 1)[0]
+        return slope
+    except:
+        return 0
+
+def calculate_market_regime(df):
+    """
+    Determine market regime based on technical indicators.
+    Returns score: > 0 = bullish, < 0 = bearish
+    """
+    regime_score = 0
+
+    # RSI regime
+    if "RSI" in df.columns:
+        recent_rsi = df["RSI"].tail(20).mean()
+        if recent_rsi > 60:
+            regime_score += 1
+        elif recent_rsi < 40:
+            regime_score -= 1
+
+    # Trend regime (price vs moving averages)
+    if all(col in df.columns for col in ["Close", "SMA_20", "SMA_50"]):
+        current_price = df["Close"].iloc[-1]
+        sma_20 = df["SMA_20"].iloc[-1]
+        sma_50 = df["SMA_50"].iloc[-1]
+
+        if current_price > sma_20 > sma_50:
+            regime_score += 2  # Strong uptrend
+        elif current_price > sma_20:
+            regime_score += 1  # Mild uptrend
+        elif current_price < sma_20 < sma_50:
+            regime_score -= 2  # Strong downtrend
+        elif current_price < sma_20:
+            regime_score -= 1  # Mild downtrend
+
+    # Volatility regime
+    if "volatility_20d" in df.columns:
+        recent_vol = df["volatility_20d"].tail(20).mean()
+        historical_vol = df["volatility_20d"].mean()
+        if recent_vol > historical_vol * 1.5:
+            regime_score -= 1  # High volatility = uncertainty
+
+    return regime_score
+
+def analyze_quarterly_technical_trends(df):
+    """
+    Chunk 3 years of technical data into quarters and analyze trends.
+    """
+    if df.empty:
+        return {}
+
+    # Add quarter column
+    df_copy = df.copy()
+    df_copy["quarter"] = df_copy.index.to_period("Q")
+
+    quarterly_trends = {}
+
+    # Define technical indicators to analyze
+    technical_indicators = [
+        "RSI", "volatility_20d", "returns", "BB_position",
+        "MACD", "MACD_histogram", "Stoch_K"
+    ]
+
+    for indicator in technical_indicators:
+        if indicator not in df_copy.columns:
+            continue
+
+        quarterly_values = []
+
+        # Calculate quarterly averages
+        for quarter, group in df_copy.groupby("quarter"):
+            if len(group) > 5:  # Need minimum data points
+                avg_value = group[indicator].mean()
+                if not np.isnan(avg_value):
+                    quarterly_values.append(avg_value)
+
+        if len(quarterly_values) >= 2:
+            # Calculate trend metrics
+            quarterly_trends[f"{indicator}_quarterly_mean"] = np.mean(quarterly_values)
+            quarterly_trends[f"{indicator}_quarterly_std"] = np.std(quarterly_values)
+            quarterly_trends[f"{indicator}_quarterly_trend"] = calculate_trend_slope(quarterly_values)
+            quarterly_trends[f"{indicator}_recent_vs_longterm"] = quarterly_values[-1] - np.mean(quarterly_values[:-1]) if len(quarterly_values) > 1 else 0
+
+            # Momentum: last 2 quarters vs previous quarters
+            if len(quarterly_values) >= 4:
+                recent_avg = np.mean(quarterly_values[-2:])
+                historical_avg = np.mean(quarterly_values[:-2])
+                quarterly_trends[f"{indicator}_momentum"] = recent_avg - historical_avg
+
+    # Price-specific quarterly analysis
+    if "Close" in df_copy.columns:
+        quarterly_returns = []
+        for quarter, group in df_copy.groupby("quarter"):
+            if len(group) > 1:
+                quarter_return = (group["Close"].iloc[-1] / group["Close"].iloc[0] - 1) * 100
+                quarterly_returns.append(quarter_return)
+
+        if quarterly_returns:
+            quarterly_trends["quarterly_return_mean"] = np.mean(quarterly_returns)
+            quarterly_trends["quarterly_return_volatility"] = np.std(quarterly_returns)
+            quarterly_trends["quarterly_return_trend"] = calculate_trend_slope(quarterly_returns)
+            quarterly_trends["recent_quarter_performance"] = quarterly_returns[-1] if quarterly_returns else 0
+
+    # Market regime detection
+    quarterly_trends["market_regime_score"] = calculate_market_regime(df_copy)
+
+    return quarterly_trends
+
+def get_technical_indicators_with_trends(ticker):
+    """
+    Get 3 years of technical data, chunk into quarters,
+    and analyze trends on quarterly scale.
+    """
+    try:
+        # Get 3 years of data instead of 1 year
+        df = yf.download(ticker, period="3y", interval="1d", progress=False)
+        if df.empty:
+            return pd.DataFrame(), {}
+
+        # 👈 ADD THE VERIFICATION CODE RIGHT HERE 👈
+        # Data range verification
+        print("=" * 50)
+        print("📊 DATA VERIFICATION")
+        print("=" * 50)
+        print(f"Data range: {df.index.min()} to {df.index.max()}")
+        print(f"Total trading days: {len(df)}")
+        print(f"Approximate years: {len(df)/252:.1f} years")
+        print(f"Expected for 3 years: ~756-780 trading days")
+
+        # Check if we have enough data
+        if len(df) < 600:  # Less than ~2.5 years
+            print("⚠️  WARNING: May not have full 3 years of data!")
+        else:
+            print("✅ Sufficient historical data confirmed")
+
+        print("=" * 50)
+        print()
+        # END OF VERIFICATION CODE
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        # Basic calculations
+        df["returns"] = df["Close"].pct_change()
+        df["log_returns"] = np.log(df["Close"]/df["Close"].shift(1))
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        # Basic calculations
+        df["returns"] = df["Close"].pct_change()
+        df["log_returns"] = np.log(df["Close"]/df["Close"].shift(1))
+
+        # Volatility indicators
+        df["volatility_5d"] = df["returns"].rolling(5).std()
+        df["volatility_20d"] = df["returns"].rolling(20).std()
+
+        # Moving averages
+        df["SMA_5"] = df["Close"].rolling(5).mean()
+        df["SMA_20"] = df["Close"].rolling(20).mean()
+        df["SMA_50"] = df["Close"].rolling(50).mean()
+        df["EMA_12"] = df["Close"].ewm(span=12).mean()
+        df["EMA_26"] = df["Close"].ewm(span=26).mean()
+
+        # Technical indicators
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+
+        # MACD
+        macd = ta.trend.MACD(df["Close"])
+        df["MACD"] = macd.macd()
+        df["MACD_signal"] = macd.macd_signal()
+        df["MACD_histogram"] = df["MACD"] - df["MACD_signal"]
+
+        # Bollinger Bands
+        bb = ta.volatility.BollingerBands(df["Close"])
+        df["BB_upper"] = bb.bollinger_hband()
+        df["BB_lower"] = bb.bollinger_lband()
+        df["BB_position"] = (df["Close"] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"])
+
+        # Stochastic
+        stoch = ta.momentum.StochasticOscillator(df["High"], df["Low"], df["Close"])
+        df["Stoch_K"] = stoch.stoch()
+        df["Stoch_D"] = stoch.stoch_signal()
+
+        # Clean data
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+        # Analyze quarterly trends
+        quarterly_trends = analyze_quarterly_technical_trends(df)
+
+        # Return full dataset for better cycle analysis
+        return df, quarterly_trends  # Return all 753 days instead of just 252
+
+    except Exception as e:
+        print(f"Technical indicators error: {e}")
+        return pd.DataFrame(), {}
+
+# ============================
+# 7. Enhanced Feature Engineering
+# ============================
+def label_cycle(trend_value, rsi_value):
+    """
+    Simple heuristic:
+    - Bullish = 1
+    - Neutral = 0
+    - Bearish = -1
+    """
+    if np.isnan(trend_value) or np.isnan(rsi_value):
+        return 0
+    if trend_value > 0 and rsi_value > 50:
+        return 1
+    elif trend_value < 0 and rsi_value < 50:
+        return -1
+    else:
+        return 0
+
+def build_feature_set_with_trends(ticker):
+    """
+    Robust feature set builder for a stock ticker.
+    Combines technicals, fundamentals, sentiment, sector, and market context.
+    Ensures 'date' alignment and safe merges with prefixed columns.
+    """
+    import pandas as pd
+    import numpy as np
+
+    # === Stock technicals ===
+    tech_df, quarterly_trends = get_technical_indicators_with_trends(ticker)
+    if tech_df.empty:
+        print(f"No technical data for {ticker}")
+        return pd.DataFrame()
+
+    tech_df = tech_df.reset_index()
+    if "index" in tech_df.columns:
+        tech_df = tech_df.rename(columns={"index": "date"})
+    if "date" not in tech_df.columns:
+        tech_df["date"] = pd.to_datetime(tech_df.index)
+    else:
+        tech_df["date"] = pd.to_datetime(tech_df["date"])
+    tech_df = tech_df.sort_values("date").reset_index(drop=True)
+
+    # === Sector context ===
+    sector_trends = {}
+    sector_etf = get_sector_etf(ticker)
+    if sector_etf:
+        sector_df, sector_trends = get_technical_indicators_with_trends(sector_etf)
+        if not sector_df.empty:
+            sector_df = sector_df.reset_index()
+            if "index" in sector_df.columns:
+                sector_df = sector_df.rename(columns={"index": "date"})
+            if "date" not in sector_df.columns:
+                sector_df["date"] = pd.to_datetime(sector_df.index)
+            else:
+                sector_df["date"] = pd.to_datetime(sector_df["date"])
+            sector_df = sector_df.sort_values("date").reset_index(drop=True)
+
+            # Add prefix but keep 'date'
+            sector_df_prefixed = sector_df.add_prefix("sector_")
+            sector_df_prefixed["date"] = sector_df["date"]
+
+            tech_df = pd.merge(tech_df, sector_df_prefixed, on="date", how="left")
+
+    # === Market context (SPY) ===
+    market_trends = {}
+    market_df, market_trends = get_technical_indicators_with_trends("SPY")
+    if not market_df.empty:
+        market_df = market_df.reset_index()
+        if "index" in market_df.columns:
+            market_df = market_df.rename(columns={"index": "date"})
+        if "date" not in market_df.columns:
+            market_df["date"] = pd.to_datetime(market_df.index)
+        else:
+            market_df["date"] = pd.to_datetime(market_df["date"])
+        market_df = market_df.sort_values("date").reset_index(drop=True)
+
+        # Add prefix but keep 'date'
+        market_df_prefixed = market_df.add_prefix("market_")
+        market_df_prefixed["date"] = market_df["date"]
+
+        tech_df = pd.merge(tech_df, market_df_prefixed, on="date", how="left")
+
+    # === Macro Data ===
+    macro_df = get_macro_data()
+    if not macro_df.empty:
+        macro_df["date"] = pd.to_datetime(macro_df["date"])
+        features_before_merge = tech_df.copy()
+        tech_df = pd.merge(tech_df, macro_df, on="date", how="left")
+        print(f"✅ Macro data merged: {list(macro_df.columns)}")
+    else:
+        print("⚠️ Macro data not available")
+
+    # === Fundamentals ===
+    fact_data = get_fmp_data(ticker, api_key=FMP_API_KEY)
+    for key, val in fact_data.items():
+        if val is not None and not np.isnan(val):
+            tech_df[f"fund_{key.lower()}"] = val
+
+    # === Sentiment ===
+    reddit_long_term = get_reddit_long_term_sentiment(ticker)
+    reddit_recent = get_reddit_recent_sentiment(ticker)
+    gdelt_df = get_gdelt_news(ticker)
+    long_term_sent = gdelt_df["sentiment"].mean() if not gdelt_df.empty else 0.0
+    short_term_sent = get_gnews_recent(ticker, api_key=GNEWS_API_KEY)
+
+    tech_df["reddit_long_term"] = reddit_long_term
+    tech_df["reddit_recent"] = reddit_recent
+    tech_df["long_term_sentiment"] = long_term_sent
+    tech_df["short_term_sentiment"] = short_term_sent
+    tech_df["combined_sentiment"] = (
+        reddit_long_term + reddit_recent + long_term_sent + short_term_sent
+    ) / 4
+
+    # === Add quarterly stock trends ===
+    for trend_name, trend_value in quarterly_trends.items():
+        if not np.isnan(trend_value):
+            tech_df[f"trend_{trend_name}"] = trend_value
+
+    # === Add sector & market trends safely ===
+    for trend_name, trend_value in sector_trends.items():
+        if not np.isnan(trend_value):
+            tech_df[f"sector_trend_{trend_name}"] = trend_value
+
+    # === DEBUG: Check what columns exist ===
+    print("=== CYCLE DEBUG INFO ===")
+    trend_cols = [col for col in tech_df.columns if 'trend' in col.lower()]
+    print("Available trend columns:", trend_cols[:10])
+
+    sector_cols = [col for col in tech_df.columns if col.startswith('sector_')]
+    print("Available sector columns:", sector_cols[:10])
+
+    market_cols = [col for col in tech_df.columns if col.startswith('market_')]
+    print("Available market columns:", market_cols[:10])
+
+    # Check specific columns the cycle function needs
+    needed_cols = ['sector_trend_price', 'market_trend_price', 'sector_RSI', 'market_RSI']
+    for col in needed_cols:
+        if col in tech_df.columns:
+            print(f"{col}: {tech_df[col].iloc[-1]}")
+        else:
+            print(f"{col}: MISSING")
+    print("========================")
+
+    # === Function to calculate cycle from available data ===
+    def calculate_cycle_from_available_data(df, prefix=""):
+        """
+        Calculate cycle using RSI and price trend from available data
+        prefix: "sector_" or "market_"
+        """
+        # Try multiple possible column names
+        possible_rsi_cols = [f"{prefix}RSI", f"{prefix}rsi", "RSI"] if prefix else ["RSI"]
+        possible_close_cols = [f"{prefix}Close", f"{prefix}close", "Close"] if prefix else ["Close"]
+
+        # Find RSI column
+        rsi_col = None
+        for col in possible_rsi_cols:
+            if col in df.columns:
+                rsi_col = col
+                break
+
+        # Find Close column
+        close_col = None
+        for col in possible_close_cols:
+            if col in df.columns:
+                close_col = col
+                break
+
+        # Get RSI value
+        rsi_value = df[rsi_col].iloc[-1] if rsi_col else np.nan
+
+        # Calculate recent price trend (last 20 days vs previous 20 days)
+        if close_col and len(df) >= 40:
+            recent_avg = df[close_col].tail(20).mean()
+            previous_avg = df[close_col].iloc[-40:-20].mean()
+            price_trend = (recent_avg - previous_avg) / previous_avg
+        else:
+            # Fallback: use trend columns if available
+            trend_col = f"{prefix}trend_quarterly_return_mean" if prefix else "trend_quarterly_return_mean"
+            if trend_col in df.columns:
+                price_trend = df[trend_col].iloc[-1] / 100  # Convert percentage to decimal
+            else:
+                price_trend = np.nan
+
+        print(f"Cycle calc for {prefix}: RSI={rsi_value:.2f}, trend={price_trend:.4f}")
+
+        # Apply cycle logic
+        if np.isnan(price_trend) or np.isnan(rsi_value):
+            return 0
+        if price_trend > 0.02 and rsi_value > 55:  # Bullish: positive trend + RSI > 55
+            return 1
+        elif price_trend < -0.02 and rsi_value < 45:  # Bearish: negative trend + RSI < 45
+            return -1
+        else:
+            return 0  # Neutral
+
+    # Calculate cycles using available data
+    tech_df["sector_cycle"] = calculate_cycle_from_available_data(tech_df, "sector_")
+    tech_df["market_cycle"] = calculate_cycle_from_available_data(tech_df, "market_")
+
+    print(f"📊 Sector cycle: {tech_df['sector_cycle'].iloc[-1]}")
+    print(f"📈 Market cycle: {tech_df['market_cycle'].iloc[-1]}")
+
+    # === Lagged + rolling features safely ===
+    for lag in [1, 2, 3, 5, 10]:
+        if "returns" in tech_df.columns:
+            tech_df[f"return_lag_{lag}"] = tech_df["returns"].shift(lag)
+        if "RSI" in tech_df.columns:
+            tech_df[f"rsi_lag_{lag}"] = tech_df["RSI"].shift(lag)
+        if "volatility_5d" in tech_df.columns:
+            tech_df[f"volatility_lag_{lag}"] = tech_df["volatility_5d"].shift(lag)
+
+    if "returns" in tech_df.columns:
+        tech_df["return_mean_5d"] = tech_df["returns"].rolling(5).mean().shift(1)
+        tech_df["return_mean_20d"] = tech_df["returns"].rolling(20).mean().shift(1)
+        tech_df["return_std_5d"] = tech_df["returns"].rolling(5).std().shift(1)
+        tech_df["return_std_20d"] = tech_df["returns"].rolling(20).std().shift(1)
+
+    # --- HANDLE NaNs ---
+    print(f"Initial feature set shape: {tech_df.shape}")
+    print(tech_df.isna().sum().sort_values(ascending=False).head(10))  # optional
+
+    # Fill forward/backward, then fill remaining with 0
+    tech_df = tech_df.ffill().bfill()
+    tech_df.fillna(0, inplace=True)
+
+    print(f"Feature set shape after handling NaNs: {tech_df.shape}")
+
+    # --- CONVERT DATETIME COLUMNS TO NUMERIC ---
+    datetime_cols = []
+    for col in tech_df.columns:
+        if np.issubdtype(tech_df[col].dtype, np.datetime64):
+            datetime_cols.append(col)
+        elif 'date' in col.lower() or 'Date' in col:
+            # Also catch any columns with 'date' in the name
+            try:
+                tech_df[col] = pd.to_datetime(tech_df[col])
+                datetime_cols.append(col)
+            except:
+                pass  # If conversion fails, it's probably not a datetime column
+
+    print("Converting datetime columns to numeric:", datetime_cols)
+
+    for col in datetime_cols:
+        try:
+            # convert datetime to seconds since epoch
+            if np.issubdtype(tech_df[col].dtype, np.datetime64):
+                tech_df[col] = tech_df[col].astype(int) // 10**9
+            else:
+                # Try to convert to datetime first, then to numeric
+                tech_df[col] = pd.to_datetime(tech_df[col]).astype(int) // 10**9
+        except Exception as e:
+            print(f"Could not convert {col} to numeric: {e}")
+            # Drop the problematic column
+            tech_df = tech_df.drop(columns=[col])
+
+    # Double-check no datetime columns remain
+    assert all(not np.issubdtype(tech_df[col].dtype, np.datetime64) for col in tech_df.columns), \
+          "Error: Some datetime columns still remain!"
+
+    print(f"Feature set ready for XGBoost, shape: {tech_df.shape}")
+
+    # --- RETURN CLEANED FEATURES ---
+    return tech_df
+# ============================
+# 8. Model Training
+# ============================
+def train_model(df, prediction_days=5):
+    df = df.copy()
+    df["Target"] = (df["Close"].shift(-prediction_days)/df["Close"]-1)*100
+    df = df.dropna()
+    if df.empty:
+        return None
+
+    # Exclude datetime columns and other non-feature columns
+    excluded_columns = ['Open','High','Low','Close','Volume','Adj Close','Target']
+
+    # Find all datetime columns (both explicit and any remaining)
+    datetime_columns = []
+    for col in df.columns:
+        if np.issubdtype(df[col].dtype, np.datetime64):
+            datetime_columns.append(col)
+        elif 'date' in col.lower() or 'Date' in col:  # catch any date-related columns
+            datetime_columns.append(col)
+
+    # Add datetime columns to exclusion list
+    excluded_columns.extend(datetime_columns)
+
+    feature_columns = [col for col in df.columns if col not in excluded_columns]
+
+    # Check if we have enough features after exclusion
+    if len(feature_columns) == 0:
+        print("Error: No valid features remaining after exclusion")
+        return None
+
+    print(f"Excluded columns: {excluded_columns}")
+    print(f"Using {len(feature_columns)} features for training")
+    print(f"Sample features: {feature_columns[:10]}")
+
+    X, y = df[feature_columns], df["Target"]
+
+    # Double-check for any remaining datetime columns in features
+    for col in X.columns:
+        if np.issubdtype(X[col].dtype, np.datetime64):
+            print(f"Warning: Found datetime column in features: {col}")
+            X = X.drop(columns=[col])
+
+    tscv = TimeSeriesSplit(n_splits=3, test_size=int(len(df)*0.2))
+    best_model, best_rmse = None, float('inf')
+
+    for train_idx, val_idx in tscv.split(X):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+        rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_model = model
+
+    print(f"Best Validation RMSE: {best_rmse:.4f}%")
+
+    if best_model:
+        feature_importance = pd.DataFrame({
+            'feature': X.columns,  # Use X.columns instead of feature_columns
+            'importance': best_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print("\nTop 10 Most Important Features:")
+        print(feature_importance.head(10))
+
+    return best_model
+
+# ============================
+# 9. Multi-Horizon Forecast
+# ============================
+def forecast_price(model, features, current_price):
+    if model is None or features.empty:
+        return {"Error": "Model or features unavailable"}
+
+    # Use the same exclusion logic as train_model
+    excluded_columns = ['Open','High','Low','Close','Volume','Adj Close','Target']
+
+    # Find all datetime columns
+    datetime_columns = []
+    for col in features.columns:
+        if np.issubdtype(features[col].dtype, np.datetime64):
+            datetime_columns.append(col)
+        elif 'date' in col.lower() or 'Date' in col:
+            datetime_columns.append(col)
+
+    # Add datetime columns to exclusion list
+    excluded_columns.extend(datetime_columns)
+
+    feature_columns = [col for col in features.columns if col not in excluded_columns]
+    latest_features = features[feature_columns].iloc[-1:].fillna(0)
+
+    try:
+        base_pred = model.predict(latest_features)[0]
+        base_price = current_price * (1 + base_pred / 100)
+        predictions = {
+            "1Wk": base_price,
+            "1Mnth": current_price * (1 + base_pred * 0.8 / 100),
+            "3Mnth": current_price * (1 + base_pred * 1.5 / 100),
+            "6Mnth": current_price * (1 + base_pred * 2.0 / 100),
+            "1Yr": current_price * (1 + base_pred * 3.0 / 100),
+        }
+        return predictions
+    except Exception as e:
+        return {"Error": str(e)}
+# ============================
+# 10. Visualization
+# ============================
+def plot_technicals_overlay(df, title_prefix="Technicals"):
+    if df.empty:
+        print("No data to plot")
+        return
+    _df = df.copy().tail(1000)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12,8), sharex=True, gridspec_kw={"height_ratios":[3,1]})
+    ax1.plot(_df.index, _df["Close"], label="Close", linewidth=2)
+    if "SMA_20" in _df.columns:
+        ax1.plot(_df.index, _df["SMA_20"], label="SMA(20)", alpha=0.7)
+    if "BB_upper" in _df.columns and "BB_lower" in _df.columns:
+        ax1.plot(_df.index, _df["BB_upper"], label="BB Upper", alpha=0.5)
+        ax1.plot(_df.index, _df["BB_lower"], label="BB Lower", alpha=0.5)
+        ax1.fill_between(_df.index, _df["BB_lower"], _df["BB_upper"], alpha=0.1)
+    ax1.set_title(f"{title_prefix}: Price with Technical Indicators")
+    ax1.legend(loc="best")
+    ax1.grid(True, alpha=0.3)
+    if "RSI" in _df.columns:
+        ax2.plot(_df.index, _df["RSI"], label="RSI", color='orange')
+        ax2.axhline(70, linestyle="--", color='red', alpha=0.5)
+        ax2.axhline(30, linestyle="--", color='green', alpha=0.5)
+        ax2.set_title("RSI (70/30)")
+        ax2.legend(loc="best")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(0,100)
+    plt.tight_layout()
+    plt.show()
+
+def plot_forecast_results(predictions, current_price, ticker):
+    if "Error" in predictions:
+        print(f"Cannot plot forecast: {predictions['Error']}")
+        return
+    horizons = list(predictions.keys())
+    prices = list(predictions.values())
+    plt.figure(figsize=(10,6))
+    plt.bar(horizons, prices, alpha=0.7, color='skyblue', edgecolor='navy')
+    plt.axhline(current_price, color='red', linestyle='--', label=f'Current Price: ${current_price:.2f}')
+    plt.title(f'{ticker} Price Forecasts')
+    plt.ylabel('Predicted Price ($)')
+    plt.xlabel('Time Horizon')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    for i, (horizon, price) in enumerate(zip(horizons, prices)):
+        plt.text(i, price + current_price*0.01, f'${price:.2f}', ha='center', va='bottom', fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+# ============================
+# 11. Complete Pipeline - Date-Aligned Version
+# ============================
+def run_complete_analysis(ticker_symbol="AAPL"):
+    """
+    Full analysis runner — builds feature set with aligned dates, trains model,
+    forecasts price, saves CSV, and reports sector/market context.
+    Ensures 'date' column is always present and datetime.
+    """
+    print(f"\n🔎 Starting analysis for {ticker_symbol}...\n")
+
+    # 1. Build feature set (with all your technicals, fundamentals, sentiment, trends)
+    features = build_feature_set_with_trends(ticker_symbol)
+
+    # DEBUG: Check if features were created properly
+    print(f"Feature set shape: {features.shape}")
+    print(features.head())  # optional, see the first few rows
+
+    # Remove NaNs before training
+    features = features.dropna()
+    print(f"Features after dropping NaN: {features.shape}")
+
+    if features.empty:
+        print(f"❌ No data available for {ticker_symbol}")
+        return None, None, None
+
+    # 2. Ensure 'date' column exists and is datetime
+    if "date" not in features.columns:
+        features = features.reset_index().rename(columns={"index": "date"})
+    features["date"] = pd.to_datetime(features["date"], errors='coerce')
+    features = features.dropna(subset=["date"])
+    features = features.sort_values("date").reset_index(drop=True)
+
+    # 3. Save to CSV
+    filename = f"{ticker_symbol}_feature_set.csv"
+    features.to_csv(filename, index=False)
+    print(f"💾 Features saved to {filename}")
+
+    # 4. Report sector/market cycle (safe get)
+    sector_cycle = features["sector_cycle"].iloc[-1] if "sector_cycle" in features and not features["sector_cycle"].empty else None
+    market_cycle = features["market_cycle"].iloc[-1] if "market_cycle" in features and not features["market_cycle"].empty else None
+    print(f"📊 Sector cycle: {sector_cycle}")
+    print(f"📈 Market cycle: {market_cycle}")
+
+    # 5. Train model
+    model = train_model(features)
+    if model is None:
+        print("❌ Model training failed. Exiting.")
+        return None, features, None
+
+    # 6. Current price
+    if "Close" in features.columns:
+        current_price = features["Close"].iloc[-1]
+        print(f"\n💰 Current {ticker_symbol} price: ${current_price:.2f}")
+    else:
+        current_price = 0
+        print("❌ 'Close' price column missing")
+
+    # 7. Forecast
+    predictions = forecast_price(model, features, current_price)
+    if "Error" not in predictions:
+        print("\n📈 Price Predictions:")
+        for horizon, price in predictions.items():
+            change_pct = ((price - current_price)/current_price)*100
+            print(f"  {horizon}: ${price:.2f} ({change_pct:+.1f}%)")
+    else:
+        print(f"❌ Forecasting error: {predictions['Error']}")
+
+    # 8. Plots
+    plot_technicals_overlay(features, title_prefix=ticker_symbol)
+    plot_forecast_results(predictions, current_price, ticker_symbol)
+
+    print(f"\n✅ Analysis complete for {ticker_symbol}!\n")
+    return model, features, predictions
+# ============================
+# 12. Run Script
+# ============================
+if __name__ == "__main__":
+    model, features, forecasts = run_complete_analysis(ticker)
